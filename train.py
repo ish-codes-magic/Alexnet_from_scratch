@@ -1,78 +1,60 @@
-from model import AlexNetModel
 import numpy as np
 import torch
-
 import torch.nn as nn
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torchvision import datasets
+from torchvision import transforms
 from torch.utils.data.sampler import SubsetRandomSampler
-from torch.utils.tensorboard import SummaryWriter
 import os
+from dotenv import load_dotenv
+import random
+from model import AlexNetModel as model
+import time
+import json
+from torch.optim.swa_utils import AveragedModel
+from torch.utils.tensorboard import SummaryWriter
+from utils import load_pretrained_state_dict, load_resume_state_dict, make_directory, save_checkpoint, Summary, AverageMeter, ProgressMeter, accuracy
+load_dotenv()
 
-torch.cuda.empty_cache()
-
-torch.cuda.memory_summary(device=None, abbreviated=False)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-# Hyperparameters
-# define model parameters
-NUM_EPOCHS = 20 
-BATCH_SIZE = 16
-MOMENTUM = 0.9
-LR_DECAY = 0.0005
-LR_INIT = 0.01
-IMAGE_DIM = 227  # pixels
-NUM_CLASSES = 10  # 10 classes for CIFAR 10 dataset
-# modify this to point to your data directory
-INPUT_ROOT_DIR = 'alexnet_data_in'
-TRAIN_IMG_DIR = 'alexnet_data_in/imagenet'
-OUTPUT_DIR = 'alexnet_data_out'
-LOG_DIR = OUTPUT_DIR + '/tblogs'  # tensorboard logs
-CHECKPOINT_DIR = OUTPUT_DIR + '/models/'  # model checkpoints
-
-
-def get_train_valid_loader(data_dir,
-                           batch_size,
-                           augment,
-                           random_seed,
-                           valid_size=0.1,
-                           shuffle=True):
+def data_loader(data_dir,
+                batch_size,
+                random_seed=42,
+                valid_size=0.1,
+                shuffle=True,
+                test=False):
+  
     normalize = transforms.Normalize(
         mean=[0.4914, 0.4822, 0.4465],
         std=[0.2023, 0.1994, 0.2010],
     )
 
     # define transforms
-    valid_transform = transforms.Compose([
+    transform = transforms.Compose([
             transforms.Resize((227,227)),
             transforms.ToTensor(),
             normalize,
     ])
-    if augment:
-        train_transform = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])
-    else:
-        train_transform = transforms.Compose([
-            transforms.Resize((227,227)),
-            transforms.ToTensor(),
-            normalize,
-        ])
+
+    if test:
+        dataset = datasets.CIFAR100(
+          root=data_dir, train=False,
+          download=True, transform=transform,
+        )
+
+        data_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=shuffle
+        )
+
+        return data_loader
 
     # load the dataset
-    train_dataset = datasets.CIFAR10(
+    train_dataset = datasets.CIFAR100(
         root=data_dir, train=True,
-        download=True, transform=train_transform,
+        download=True, transform=transform,
     )
 
     valid_dataset = datasets.CIFAR10(
         root=data_dir, train=True,
-        download=True, transform=valid_transform,
+        download=True, transform=transform,
     )
 
     num_train = len(train_dataset)
@@ -96,177 +78,241 @@ def get_train_valid_loader(data_dir,
     return (train_loader, valid_loader)
 
 
-def get_test_loader(data_dir,
-                    batch_size,
-                    shuffle=True):
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    )
-
-    # define transform
-    transform = transforms.Compose([
-        transforms.Resize((227,227)),
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    dataset = datasets.CIFAR10(
-        root=data_dir, train=False,
-        download=True, transform=transform,
-    )
-
-    data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle
-    )
-
-    return data_loader
+def build_model(num_classes,model_arch,model_ema_decay,device) -> [nn.Module, nn.Module]:
+    vgg_model = model(num_classes=num_classes)
+    vgg_model = vgg_model.to(device)
+    
+    ema_avg = lambda averaged_model_parameter, model_parameter, num_averaged: (1 - model_ema_decay) * averaged_model_parameter + model_ema_decay * model_parameter
+    ema_vgg_model = AveragedModel(vgg_model, device=device, avg_fn=ema_avg)
+    return vgg_model, ema_vgg_model
 
 
-# CIFAR10 dataset 
-train_loader, valid_loader = get_train_valid_loader(data_dir = './data',                                      
-                                                    batch_size = BATCH_SIZE ,
-                                                    augment = False,                             		     
-                                                    random_seed = 1)
+def loss_def(loss_label_smoothing, device) -> nn.CrossEntropyLoss:
+    criterion = nn.CrossEntropyLoss(label_smoothing=loss_label_smoothing)
+    criterion = criterion.to(device)
+    
+    return criterion
 
-test_loader = get_test_loader(data_dir = './data',
-                              batch_size = BATCH_SIZE)
+def optimizer_def(model, learning_rate, momentum, weight_decay) -> torch.optim.SGD:
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+    return optimizer
 
-# setting the seed
-seed = torch.initial_seed()
-print(f"Seed: {seed}")
+def scheduler_def(optimizer, t_0:int, t_mult, eta_min) -> torch.optim.lr_scheduler.MultiStepLR:
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, t_0, t_mult, eta_min)
+    return scheduler
 
-
-
-
-tbwriter = SummaryWriter(log_dir=LOG_DIR)
-
-#setting the model
-alexnet = AlexNetModel(num_classes=NUM_CLASSES).to(device)
-alexnet = nn.parallel.DataParallel(alexnet)
-
-#setting the optimiser
-optimiser = torch.optim.SGD(params=alexnet.parameters(), lr=LR_INIT, momentum=MOMENTUM, weight_decay=LR_DECAY)
-
-#setting the loss function
-criterion = nn.CrossEntropyLoss()
-
-total_steps = 1
-for epoch in range(NUM_EPOCHS):
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, f'alexnet_{epoch+1}.pth')
-    if os.path.exists(checkpoint_path):
-        state = torch.load(checkpoint_path)
-        alexnet.load_state_dict(state['model'])
-        optimiser.load_state_dict(state['optimiser'])
-        seed = state['seed']
-        total_steps = state['total_steps']
-    else:
-        print(f"Checkpoint {checkpoint_path} not found")
-        print("Training at {} epoch".format(epoch+1))
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            
-            # Forward pass
-            outputs = alexnet(images)
+def train(train_loader, vgg_model, ema_vgg_model, criterion, optimizer, device, scaler, epoch, writer, train_print_frequency):
+    batches = len(train_loader)
+    
+    batch_time = AverageMeter("Time", ":6.3f", Summary.NONE)
+    data_time = AverageMeter("Data", ":6.3f", Summary.NONE)
+    losses = AverageMeter("Loss", ":6.6f", Summary.NONE)
+    accuracy_train = AverageMeter("Accuracy", ":6.2f", Summary.NONE)
+    acc1 = AverageMeter("Acc@1", ":6.2f", Summary.AVERAGE)
+    acc5 = AverageMeter("Acc@5", ":6.2f", Summary.AVERAGE)
+    progress = ProgressMeter(batches,
+                             [batch_time, data_time, losses, acc1, acc5],
+                             prefix=f"Epoch: [{epoch + 1}]")
+    
+    vgg_model.train()
+    
+    # Get the initialization training time
+    end = time.time()
+    
+    total = 0
+    correct = 0
+    
+    for batch_index, (images, labels) in enumerate(train_loader):
+        images = images.to(device)
+        labels = labels.to(device)
+        
+        # Calculate the time it takes to load a batch of data
+        data_time.update(time.time() - end)
+        
+        batch_size = images.size(0)
+        
+        optimizer.zero_grad()
+        
+        with torch.cuda.amp.autocast():
+            outputs = vgg_model(images)
             loss = criterion(outputs, labels)
-            
-            # Backward and optimize
-            optimiser.zero_grad()
-            loss.backward()
-            optimiser.step()
-            
-            if (total_steps) % 3 == 0:
-                with torch.no_grad():
-                    _, predicted = torch.max(outputs, 1)
-                    accuracy = torch.sum(predicted == labels).item() / labels.size(0)
-                    print (f'Epoch: {epoch+1}, Loss: {loss.item():.4f}')
-                    tbwriter.add_scalar('Loss/train', loss.item(), total_steps)
-                    tbwriter.add_scalar('Accuracy/train', accuracy, total_steps)
-                
-    total_steps += 1
-        
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, f'alexnet_{epoch+1}.pth')
-        
-    state = {
-        'epoch': epoch,
-        'total_steps': total_steps,
-        'optimiser': optimiser.state_dict(),
-        'model': alexnet.state_dict(),
-        'seed': seed
-    }
-    torch.save(state, checkpoint_path)
-    
-def calculate_accuracy(test_loader):
-    """
-    Calculate the accuracy of the model on the test set
-    
-    Args:
-        test_loader: DataLoader object
-    
-    Returns:
-        accuracy: float
-    """
-    with torch.no_grad():
-        correct = 0
-        total = 0
-        for images, labels in test_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            checkpoint_path = os.path.join(CHECKPOINT_DIR, 'alexnet_20.pth')
-            state = torch.load(checkpoint_path)
-            alexnet.load_state_dict(state['model'])
-            outputs = alexnet(images)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            del images, labels, outputs
-        accuracy = 100 * correct / total
+            
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
-    return accuracy
-
-accuracy = calculate_accuracy(test_loader)
-
-print('Accuracy of the network on the {} test images: {} %'.format(10000, accuracy)) 
-
-
-def calculate_topk_error(outputs, targets, topk=(1, 5)):
-    """Calculates top-k error rates
-
-    Args:
-        outputs (torch.Tensor): Model prediction outputs (logits).
-        targets (torch.Tensor): Ground truth labels.
-        topk (tuple, optional): Values of k for which to calculate errors. 
-                                Defaults to (1, 5).
-
-    Returns:
-        list: Top-k error rates.
-    """
-
+        ema_vgg_model.update_parameters(vgg_model)
+        
+        top1, top5 = accuracy(outputs, labels, topk=(1, 5))
+        losses.update(loss.item(), batch_size)
+        acc1.update(top1[0], batch_size)
+        acc5.update(top5[0], batch_size)
+        
+        # Calculate the time it takes to fully train a batch of data
+        batch_time.update(time.time() - end)
+        end = time.time()
+        
+        if batch_index % train_print_frequency == 0:
+            # Record loss during training and output to file
+            writer.add_scalar("Train/Loss", loss.item(), batch_index)
+            progress.display(batch_index)
+        
+        batch_index += 1
+    
+    return correct / total * 100, losses.avg, acc1.avg.item(), acc5.avg.item()
+        
+def validate(valid_loader, ema_vgg_model, criterion, device, epoch, writer):
     with torch.no_grad():
-        maxk = max(topk)  # Get the maximum 'k'
+        correct = 0
+        total = 0
+        for images, labels in valid_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = ema_vgg_model(images)
+            loss = criterion(outputs, labels)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            top1, top5 = accuracy(outputs, labels, topk=(1, 5)) 
+            writer.add_scalar("Valid/Loss", loss.item(), epoch)
+    return correct / total * 100, top1[0].item(), top5[0].item(), loss.item()
+        
 
-        batch_size = targets.size(0)
+def main():
+    
+    seed = int(os.getenv('seed'))
 
-        # Find indices of top-k predictions
-        _, pred = outputs.topk(maxk, dim=1, largest=True, sorted=True)
-        pred = pred.t()  # Transpose
+    # Model configure
+    model_arch_name = os.getenv('model_arch_name')
+    model_num_classes = int(os.getenv('model_num_classes'))
 
-        # Expand target to compare with top-k predictions 
-        correct = pred.eq(targets.view(1, -1).expand_as(pred))
+    # Experiment name, easy to save weights and log files
+    exp_name = os.getenv('exp_name')
 
-        error_rates = []
-        for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-            error_rates.append(100.0 - (correct_k.mul_(100.0 / batch_size)))
-        return error_rates
+    # Dataset address
+    train_image_dir = os.getenv('train_image_dir')
+    test_image_dir = os.getenv('test_image_dir')
 
-for data, target in test_loader:
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, 'alexnet_20.pth')
-    state = torch.load(checkpoint_path)
-    alexnet.load_state_dict(state['model'])
-    output = alexnet(data)
-    top1_error, top5_error = calculate_topk_error(output, target)
+    batch_size = int(os.getenv('batch_size'))
 
-    print(f"Top-1 Error: {top1_error.item():.2f}%")
-    print(f"Top-5 Error: {top5_error.item():.2f}%")
+    # The address to load the pretrained model
+    pretrained_model_weights_path = os.getenv('pretrained_model_weights_path')
+
+    # Total num epochs
+    epochs = int(os.getenv('epochs'))
+
+    # Loss parameters
+    loss_label_smoothing = float(os.getenv('loss_label_smoothing'))
+    
+    resume_model_weights_path = os.getenv('resume_model_weights_path')
+    # Optimizer parameter
+    model_lr = float(os.getenv('model_lr'))
+    model_momentum = float(os.getenv('model_momentum'))
+    model_weight_decay = float(os.getenv('model_weight_decay'))
+    model_ema_decay = float(os.getenv('model_ema_decay'))
+
+    # Learning rate scheduler parameter
+    lr_scheduler_T_0 = int(os.getenv('lr_scheduler_T_0'))
+    lr_scheduler_T_mult = int(os.getenv('lr_scheduler_T_mult'))
+    lr_scheduler_eta_min = float(os.getenv('lr_scheduler_eta_min'))
+    
+    train_print_frequency = int(os.getenv('train_print_frequency'))
+    # Device configuration
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    scaler = torch.cuda.amp.GradScaler()
+    
+    start_epoch = 0
+    
+    # CIFAR100 dataset 
+    train_loader, valid_loader = data_loader(data_dir=train_image_dir,
+                                         batch_size=batch_size)
+    
+    vgg_model, ema_vgg_model = build_model(num_classes=model_num_classes,model_arch=model_arch_name,model_ema_decay=model_ema_decay,device=device)
+    
+    criterion = loss_def(loss_label_smoothing, device)
+    
+    optimizer = optimizer_def(vgg_model, model_lr, model_momentum, model_weight_decay)
+    
+    scheduler = scheduler_def(optimizer, lr_scheduler_T_0, lr_scheduler_T_mult, lr_scheduler_eta_min)
+    
+    if os.listdir(resume_model_weights_path) is not None:
+        max_epoch = 0
+        for files in os.listdir(resume_model_weights_path):
+            try:
+                index = int(files.split("_")[1].split(".")[0])
+                if index > max_epoch:
+                    max_epoch = index
+            except:
+                pass
+    
+        pretrained_model_weights_path = resume_model_weights_path + f'epoch_{max_epoch}.pth.tar'
+        print(max_epoch)
+        vgg_model, ema_vgg_model, start_epoch, optimizer, scheduler = load_resume_state_dict(vgg_model, pretrained_model_weights_path, ema_vgg_model, optimizer, scheduler)
+        print(f"Loaded `{resume_model_weights_path}` resume model weights successfully.")
+        
+    else:
+        print("Resume model weights not found. Starting from scratch.")
+        
+        
+    results_dir = os.path.join("results", "model",exp_name)
+    make_directory(results_dir)
+    
+        
+    for epoch in range(start_epoch, epochs):
+        # Create training process log file
+        writer_train = SummaryWriter(os.path.join("results", "logs", exp_name, "train", f"epoch_{epoch}"))
+        train_acc, loss_train, train_acc1, train_acc5 = train(train_loader, vgg_model, ema_vgg_model, criterion, optimizer, device, scaler, epoch, writer_train, train_print_frequency)
+        valid_writer = SummaryWriter(os.path.join("results", "logs", exp_name, "valid", f"epoch_{epoch}"))
+        valid_acc, valid_acc1, valid_acc5, loss_valid = validate(valid_loader, ema_vgg_model, criterion, device, epoch, valid_writer)
+        
+        #save all the variables as a JSON file
+        json_path = "./results/model/"+exp_name+"/results.json"
+        with open(json_path, "a+") as f:
+            if epoch == 0:
+                json.dump([{"epoch": epoch + 1,
+                           "train_loss": loss_train,
+                           "valid_loss": loss_valid,
+                           "valid_accuracy": valid_acc,
+                           "acc1_train": train_acc1,
+                           "acc5_train": train_acc5,
+                           "acc1_valid": valid_acc1,
+                           "acc5_valid": valid_acc5}], f)
+            else:
+                details_list = json.load(f)
+                details_list.append({"epoch": epoch + 1,
+                       "train_loss": loss_train,
+                       "valid_loss": loss_valid,
+                       "valid_accuracy": valid_acc,
+                       "acc1_train": train_acc1,
+                       "acc5_train": train_acc5,
+                       "acc1_valid": valid_acc1,
+                       "acc5_valid": valid_acc5})
+                json.dump(details_list, f)
+        
+        save_checkpoint({"epoch": epoch + 1,
+                         "state_dict": vgg_model.state_dict(),
+                         "ema_state_dict": ema_vgg_model.state_dict(),
+                         "optimizer": optimizer.state_dict(),
+                         "scheduler": scheduler.state_dict(),
+                         "train_loss": loss_train,
+                         "valid_loss": loss_valid,
+                         "valid_accuracy": valid_acc,
+                         "acc1_train": train_acc1,
+                         "acc5_train": train_acc5,
+                         "acc1_valid": valid_acc1,
+                         "acc5_valid": valid_acc5},
+                        f"epoch_{epoch + 1}.pth.tar",
+                        results_dir)
+        
+if __name__ == '__main__':
+    main()
+    
